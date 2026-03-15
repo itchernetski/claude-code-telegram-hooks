@@ -66,4 +66,7 @@ for file in "${md_files[@]}"; do
     -F caption="${filename}" > /dev/null 2>&1
 done
 
+# Update marker so next Stop only picks up files changed after this notification
+touch "/tmp/.claude_session_start_${session_id}"
+
 exit 0

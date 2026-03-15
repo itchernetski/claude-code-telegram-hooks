@@ -32,13 +32,6 @@ if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
   task_summary=$(head -20 "$transcript_path" 2>/dev/null | jq -r 'select(.role == "user") | .content // empty' 2>/dev/null | head -1 | cut -c1-200)
 fi
 
-# Fallback: check for recent plan file
-if [ -z "$task_summary" ]; then
-  plan_file=$(ls -t "$HOME/.claude/plans/"*.md 2>/dev/null | head -1)
-  if [ -n "$plan_file" ]; then
-    task_summary=$(head -1 "$plan_file" | sed 's/^#* *//')
-  fi
-fi
 
 # Check for .md files modified in the last 5 minutes in the working directory
 md_files=()

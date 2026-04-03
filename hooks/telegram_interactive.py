@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Claude Code hook: Telegram interactive control.
-Handles ExitPlanMode (approve/reject plans) and AskUserQuestion (answer via buttons).
+Claude Code hook: Telegram delayed notifications.
+IDE shows plans/questions immediately. If user doesn't respond within NOTIFY_DELAY,
+a read-only notification is sent to Telegram.
 """
 
 import json
 import os
+import signal
 import sys
-import time
 import glob
 import urllib.request
 import urllib.parse
@@ -15,9 +16,9 @@ import urllib.error
 
 # --- Config ---
 ENV_FILE = os.path.expanduser("~/.claude/.env")
-POLL_INTERVAL = 3  # seconds
-POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "120"))  # seconds
+NOTIFY_DELAY = int(os.environ.get("NOTIFY_DELAY", "120"))  # seconds before Telegram notification
 MAX_MSG_LEN = 4096  # Telegram message limit
+CANCEL_DIR = "/tmp"
 
 
 def load_env():
@@ -52,10 +53,8 @@ def tg_request(token, method, data=None):
 def send_message(token, chat_id, text, reply_markup=None):
     """Send a message to Telegram, splitting if needed."""
     messages = []
-    # Split long text into chunks
     chunks = []
     while len(text) > MAX_MSG_LEN:
-        # Find a good split point
         split_at = text.rfind("\n", 0, MAX_MSG_LEN)
         if split_at == -1:
             split_at = MAX_MSG_LEN
@@ -69,60 +68,12 @@ def send_message(token, chat_id, text, reply_markup=None):
             "text": chunk,
             "parse_mode": "Markdown",
         }
-        # Add buttons only to the last chunk
         if reply_markup and i == len(chunks) - 1:
             data["reply_markup"] = reply_markup
         result = tg_request(token, "sendMessage", data)
         if result and result.get("ok"):
             messages.append(result["result"])
     return messages
-
-
-def poll_callback(token, chat_id, callback_prefix, timeout):
-    """Poll for a callback_query matching our prefix. Returns callback data or None."""
-    # First, flush old updates
-    tg_request(token, "getUpdates", {"offset": -1, "limit": 1})
-    time.sleep(0.5)
-
-    # Get the latest update_id to use as offset
-    flush = tg_request(token, "getUpdates", {"limit": 1, "timeout": 0})
-    offset = 0
-    if flush and flush.get("ok") and flush["result"]:
-        offset = flush["result"][-1]["update_id"] + 1
-
-    start = time.time()
-    while time.time() - start < timeout:
-        result = tg_request(token, "getUpdates", {
-            "offset": offset,
-            "limit": 10,
-            "timeout": POLL_INTERVAL,
-        })
-        if not result or not result.get("ok"):
-            time.sleep(POLL_INTERVAL)
-            continue
-
-        for update in result.get("result", []):
-            offset = update["update_id"] + 1
-
-            # Check for callback_query
-            cb = update.get("callback_query")
-            if cb and cb.get("data", "").startswith(callback_prefix):
-                # Answer the callback to remove the loading indicator
-                tg_request(token, "answerCallbackQuery", {
-                    "callback_query_id": cb["id"],
-                    "text": "Received!",
-                })
-                return cb["data"][len(callback_prefix):]
-
-            # Check for text message (for "Edit" flow)
-            msg = update.get("message")
-            if msg and str(msg.get("chat", {}).get("id")) == str(chat_id):
-                text = msg.get("text", "")
-                if text.startswith("/"):
-                    continue  # Skip commands
-                return f"text:{text}"
-
-    return None
 
 
 def find_plan_file(cwd):
@@ -142,15 +93,26 @@ def find_plan_file(cwd):
     return max(candidates, key=os.path.getmtime)
 
 
-def handle_exit_plan_mode(token, chat_id, hook_input):
-    """Handle ExitPlanMode (PostToolUse): send plan to Telegram, get feedback via additionalContext."""
-    cwd = hook_input.get("cwd", "")
+def cancel_signal_path(tool_name, session_id):
+    """Get the path for the cancel signal file."""
+    safe_session = session_id.replace("/", "_") if session_id else "default"
+    return os.path.join(CANCEL_DIR, f".claude_tg_{tool_name}_{safe_session}")
 
-    # Try to get plan from tool_input first (ExitPlanMode may include plan text)
+
+def pid_file_path(tool_name, session_id):
+    """Get the path for storing the background process PID."""
+    safe_session = session_id.replace("/", "_") if session_id else "default"
+    return os.path.join(CANCEL_DIR, f".claude_tg_{tool_name}_{safe_session}.pid")
+
+
+def handle_exit_plan_mode_pre(token, chat_id, hook_input):
+    """PreToolUse: fork background notifier, return immediately for IDE."""
+    cwd = hook_input.get("cwd", "")
+    session_id = hook_input.get("session_id", "default")
+
+    # Read plan text
     tool_input = hook_input.get("tool_input", {})
     plan_text = tool_input.get("plan", "")
-
-    # Fallback: read plan file
     if not plan_text:
         plan_file = find_plan_file(cwd)
         if not plan_file:
@@ -158,150 +120,146 @@ def handle_exit_plan_mode(token, chat_id, hook_input):
         with open(plan_file) as f:
             plan_text = f.read()
 
+    # Clean up any previous cancel signal
+    sig_path = cancel_signal_path("plan", session_id)
+    if os.path.exists(sig_path):
+        os.remove(sig_path)
+
+    # Fork background process
+    pid = os.fork()
+    if pid > 0:
+        # Parent: save child PID and return immediately
+        pid_path = pid_file_path("plan", session_id)
+        with open(pid_path, "w") as f:
+            f.write(str(pid))
+        sys.exit(0)
+
+    # Child: detach and become background notifier
+    os.setsid()
+    try:
+        _background_notify_plan(token, chat_id, plan_text, sig_path)
+    except Exception:
+        pass
+    os._exit(0)
+
+
+def _background_notify_plan(token, chat_id, plan_text, sig_path):
+    """Background process: sleep, then send plan notification if not cancelled."""
+    import time
+    time.sleep(NOTIFY_DELAY)
+
+    # Check cancel signal
+    if os.path.exists(sig_path):
+        os.remove(sig_path)
+        return
+
     # Escape markdown special chars for Telegram
     safe_text = plan_text.replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("`", "\\`")
-    # Truncate if too long
     if len(safe_text) > MAX_MSG_LEN * 3:
         safe_text = safe_text[:MAX_MSG_LEN * 3] + "\n\n... (truncated)"
 
-    # Send plan to Telegram
-    prefix = f"plan_{int(time.time())}_"
-    header = "📋 *Claude Code Plan*\n\n"
+    header = "📋 *Claude Code ждёт одобрения плана*\n\n"
     send_message(token, chat_id, header + safe_text)
 
-    # Send action buttons
-    keyboard = {
-        "inline_keyboard": [[
-            {"text": "✅ Approve", "callback_data": f"{prefix}approve"},
-            {"text": "❌ Reject", "callback_data": f"{prefix}reject"},
-            {"text": "✏️ Edit", "callback_data": f"{prefix}edit"},
-        ]]
-    }
-    send_message(token, chat_id, "Что сделать с планом?", reply_markup=keyboard)
 
-    # Poll for response
-    response = poll_callback(token, chat_id, prefix, POLL_TIMEOUT)
-
-    if response is None:
-        send_message(token, chat_id, "⏰ Нет ответа, ожидание в IDE.")
-        sys.exit(0)
-
-    if response == "approve":
-        send_message(token, chat_id, "✅ План одобрен!")
-        output = {
-            "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
-                "additionalContext": "The user approved the plan via Telegram. Proceed with implementation.",
-            }
-        }
-        print(json.dumps(output))
-        sys.exit(0)
-
-    if response == "reject":
-        send_message(token, chat_id, "❌ План отклонён.")
-        output = {
-            "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
-                "additionalContext": "The user REJECTED the plan via Telegram. Do NOT proceed with implementation. Ask the user what they'd like to change.",
-            }
-        }
-        print(json.dumps(output))
-        sys.exit(0)
-
-    if response == "edit":
-        send_message(token, chat_id, "✏️ Напишите ваш фидбек:")
-        feedback = poll_callback(token, chat_id, "", POLL_TIMEOUT)
-        feedback_text = ""
-        if feedback and feedback.startswith("text:"):
-            feedback_text = feedback[5:]
-        elif feedback:
-            feedback_text = feedback
-
-        send_message(token, chat_id, f"📝 Фидбек получен: {feedback_text}")
-        output = {
-            "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
-                "additionalContext": f"The user reviewed the plan via Telegram and requested changes. Do NOT proceed as-is. Their feedback: {feedback_text}",
-            }
-        }
-        print(json.dumps(output))
-        sys.exit(0)
-
-
-def handle_ask_user_question(token, chat_id, hook_input):
-    """Handle AskUserQuestion: send options as inline keyboard."""
+def handle_ask_user_question_pre(token, chat_id, hook_input):
+    """PreToolUse: fork background notifier, return immediately for IDE."""
+    session_id = hook_input.get("session_id", "default")
     tool_input = hook_input.get("tool_input", {})
     questions = tool_input.get("questions", [])
 
     if not questions:
         sys.exit(0)
 
-    answers = {}
-    prefix = f"q_{int(time.time())}_"
+    # Clean up any previous cancel signal
+    sig_path = cancel_signal_path("question", session_id)
+    if os.path.exists(sig_path):
+        os.remove(sig_path)
 
-    for q_idx, q in enumerate(questions):
+    # Fork background process
+    pid = os.fork()
+    if pid > 0:
+        # Parent: save child PID and return immediately
+        pid_path = pid_file_path("question", session_id)
+        with open(pid_path, "w") as f:
+            f.write(str(pid))
+        sys.exit(0)
+
+    # Child: detach and become background notifier
+    os.setsid()
+    try:
+        _background_notify_question(token, chat_id, questions, sig_path)
+    except Exception:
+        pass
+    os._exit(0)
+
+
+def _background_notify_question(token, chat_id, questions, sig_path):
+    """Background process: sleep, then send question notification if not cancelled."""
+    import time
+    time.sleep(NOTIFY_DELAY)
+
+    # Check cancel signal
+    if os.path.exists(sig_path):
+        os.remove(sig_path)
+        return
+
+    # Format questions as readable text
+    for q in questions:
         question_text = q.get("question", "")
         header_text = q.get("header", "")
         options = q.get("options", [])
-        multi_select = q.get("multiSelect", False)
 
-        # Build message
-        msg = f"❓ *{header_text}*\n{question_text}"
-        if multi_select:
-            msg += "\n_(можно выбрать несколько)_"
+        msg = f"❓ *Claude Code задал вопрос*\n\n"
+        if header_text:
+            msg += f"*{header_text}*\n"
+        msg += f"{question_text}\n\n"
 
-        # Build inline keyboard (1 button per row for readability)
-        q_prefix = f"{prefix}{q_idx}_"
-        keyboard_rows = []
-        for opt_idx, opt in enumerate(options):
-            label = opt.get("label", f"Option {opt_idx}")
-            desc = opt.get("description", "")
-            btn_text = label
-            if desc:
-                btn_text = f"{label} — {desc}"
-            # Truncate button text to 64 chars (Telegram limit)
-            if len(btn_text) > 64:
-                btn_text = btn_text[:61] + "..."
-            keyboard_rows.append([{
-                "text": btn_text,
-                "callback_data": f"{q_prefix}{opt_idx}",
-            }])
+        if options:
+            msg += "Варианты:\n"
+            for opt in options:
+                label = opt.get("label", "")
+                desc = opt.get("description", "")
+                msg += f"• {label}"
+                if desc:
+                    msg += f" — {desc}"
+                msg += "\n"
 
-        keyboard = {"inline_keyboard": keyboard_rows}
-        send_message(token, chat_id, msg, reply_markup=keyboard)
+        send_message(token, chat_id, msg)
 
-        # Poll for answer
-        response = poll_callback(token, chat_id, q_prefix, POLL_TIMEOUT)
 
-        if response is None:
-            send_message(token, chat_id, "⏰ No response, falling through to IDE.")
-            sys.exit(0)
+def handle_post_tool(hook_input):
+    """PostToolUse: write cancel signal to prevent delayed Telegram notification."""
+    tool_name = hook_input.get("tool_name", "")
+    session_id = hook_input.get("session_id", "default")
 
-        # Map response back to option label
+    if tool_name == "ExitPlanMode":
+        key = "plan"
+    elif tool_name == "AskUserQuestion":
+        key = "question"
+    else:
+        sys.exit(0)
+
+    # Write cancel signal
+    sig_path = cancel_signal_path(key, session_id)
+    with open(sig_path, "w") as f:
+        f.write("cancelled")
+
+    # Kill background process if still running
+    pid_path = pid_file_path(key, session_id)
+    if os.path.exists(pid_path):
         try:
-            opt_idx = int(response)
-            selected = options[opt_idx].get("label", f"Option {opt_idx}")
-        except (ValueError, IndexError):
-            selected = response
+            with open(pid_path) as f:
+                pid = int(f.read().strip())
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, ValueError, OSError):
+            pass
+        finally:
+            try:
+                os.remove(pid_path)
+            except OSError:
+                pass
 
-        answers[question_text] = selected
-        send_message(token, chat_id, f"✅ Selected: {selected}")
-
-    # Build context for Claude
-    answer_lines = []
-    for q_text, answer in answers.items():
-        answer_lines.append(f'- "{q_text}" → "{answer}"')
-    context = "User answered questions via Telegram:\n" + "\n".join(answer_lines)
-
-    output = {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": "User answered via Telegram",
-            "additionalContext": context,
-        }
-    }
-    print(json.dumps(output))
     sys.exit(0)
 
 
@@ -315,11 +273,18 @@ def main():
 
     hook_input = json.loads(sys.stdin.read())
     tool_name = hook_input.get("tool_name", "")
+    hook_event = hook_input.get("hook_event_name", "")
 
+    # PostToolUse: cancel delayed notifications
+    if hook_event == "PostToolUse":
+        handle_post_tool(hook_input)
+        return
+
+    # PreToolUse: fork background notifier, return immediately
     if tool_name == "ExitPlanMode":
-        handle_exit_plan_mode(token, chat_id, hook_input)
+        handle_exit_plan_mode_pre(token, chat_id, hook_input)
     elif tool_name == "AskUserQuestion":
-        handle_ask_user_question(token, chat_id, hook_input)
+        handle_ask_user_question_pre(token, chat_id, hook_input)
     else:
         sys.exit(0)
 

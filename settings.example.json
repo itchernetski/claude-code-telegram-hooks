@@ -21,20 +21,36 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ~/.claude/hooks/telegram_interactive.py",
-            "timeout": 180
+            "command": "python3 ~/.claude/hooks/telegram_interactive.py"
+          }
+        ]
+      },
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/telegram_interactive.py"
           }
         ]
       }
     ],
     "PostToolUse": [
       {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/telegram_interactive.py"
+          }
+        ]
+      },
+      {
         "matcher": "ExitPlanMode",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ~/.claude/hooks/telegram_interactive.py",
-            "timeout": 180
+            "command": "python3 ~/.claude/hooks/telegram_interactive.py"
           }
         ]
       }

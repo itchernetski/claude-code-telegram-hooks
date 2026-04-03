@@ -1,12 +1,11 @@
 # Claude Code Telegram Hooks
 
-Control Claude Code from Telegram. Get notifications, approve plans, and answer questions — all without leaving your phone.
+Control Claude Code from Telegram. Get notifications when Claude needs your attention — plans to approve, questions to answer, and task completions.
 
 ## Features
 
+- **IDE-first interaction** — plans and questions show in IDE immediately; if you don't respond within a configurable delay, a notification is sent to Telegram
 - **Completion notifications** — get a Telegram message when Claude finishes a task, with any generated `.md` files attached
-- **Interactive plan approval** — review plans in Telegram and approve, reject, or request changes via inline buttons
-- **Remote question answering** — when Claude asks you a question (AskUserQuestion), answer it through Telegram buttons
 - **Status line** — see context window usage %, 5-hour API limit %, and time until reset right in your terminal
 
 Example status line:
@@ -16,7 +15,7 @@ skills · 12% ctx · 22% limit · 3h46m before reset
 
 ## Prerequisites
 
-- **macOS** (uses Keychain for OAuth credentials in status line)
+- **macOS** (uses `os.fork()` for background notifications and Keychain for OAuth in status line)
 - **Python 3** (pre-installed on macOS)
 - **jq** — `brew install jq`
 - **Telegram bot** — create one via [@BotFather](https://t.me/BotFather)
@@ -59,6 +58,7 @@ chmod +x ~/.claude/utils/statusline.sh
 cat > ~/.claude/.env << 'EOF'
 TELEGRAM_BOT_TOKEN=your_bot_token_here
 TELEGRAM_CHAT_ID=your_chat_id_here
+NOTIFY_DELAY=120
 EOF
 
 chmod 600 ~/.claude/.env
@@ -72,33 +72,25 @@ The key sections to add:
 
 ```json
 {
-  "statusLine": {
-    "type": "command",
-    "command": "~/.claude/utils/statusline.sh"
-  },
   "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "",
-        "hooks": [{ "type": "command", "command": "~/.claude/hooks/session-marker.sh" }]
-      }
-    ],
     "PreToolUse": [
       {
         "matcher": "AskUserQuestion",
-        "hooks": [{ "type": "command", "command": "python3 ~/.claude/hooks/telegram_interactive.py", "timeout": 180 }]
+        "hooks": [{ "type": "command", "command": "python3 ~/.claude/hooks/telegram_interactive.py" }]
+      },
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [{ "type": "command", "command": "python3 ~/.claude/hooks/telegram_interactive.py" }]
       }
     ],
     "PostToolUse": [
       {
-        "matcher": "ExitPlanMode",
-        "hooks": [{ "type": "command", "command": "python3 ~/.claude/hooks/telegram_interactive.py", "timeout": 180 }]
-      }
-    ],
-    "Stop": [
+        "matcher": "AskUserQuestion",
+        "hooks": [{ "type": "command", "command": "python3 ~/.claude/hooks/telegram_interactive.py" }]
+      },
       {
-        "matcher": "",
-        "hooks": [{ "type": "command", "command": "~/.claude/hooks/telegram-notify.sh", "async": true }]
+        "matcher": "ExitPlanMode",
+        "hooks": [{ "type": "command", "command": "python3 ~/.claude/hooks/telegram_interactive.py" }]
       }
     ]
   }
@@ -113,22 +105,37 @@ The hooks will be picked up on the next session.
 
 ```
 ┌─────────────┐     ┌──────────────────┐     ┌──────────┐
-│ Claude Code  │────▶│  Hook Scripts     │────▶│ Telegram │
+│ Claude Code  │────▶│  Hook Scripts     │     │ Telegram │
 │              │     │                  │     │   Bot    │
 │ SessionStart │────▶│ session-marker.sh│     │          │
-│ AskQuestion  │────▶│ telegram_inter.. │◀───▶│ Buttons  │
-│ ExitPlanMode │────▶│ telegram_inter.. │◀───▶│ Buttons  │
+│ AskQuestion  │────▶│ PreToolUse: fork │     │          │
+│              │     │   bg notifier    │     │          │
+│ (user answers│────▶│ PostToolUse:     │     │          │
+│  in IDE)     │     │   cancel signal  │     │          │
+│              │     │                  │     │          │
+│ (user AFK)   │     │ bg process wakes │────▶│ Notify   │
+│              │     │   after delay    │     │          │
 │ Stop         │────▶│ telegram-notify  │────▶│ Message  │
 └─────────────┘     └──────────────────┘     └──────────┘
 ```
+
+### Flow
+
+1. Claude calls `AskUserQuestion` or `ExitPlanMode`
+2. **PreToolUse** hook fires → forks a background process with a timer → returns immediately
+3. IDE shows the plan/question to the user (no delay)
+4. **If user responds in IDE** → PostToolUse fires → writes cancel signal → background process is killed
+5. **If user is AFK** → background process wakes up after `NOTIFY_DELAY` seconds → sends read-only notification to Telegram
 
 ### Hook events
 
 | Event | Script | What happens |
 |-------|--------|-------------|
 | `SessionStart` | `session-marker.sh` | Creates a timestamp marker for tracking file changes |
-| `PreToolUse` → `AskUserQuestion` | `telegram_interactive.py` | Sends question + options as inline buttons, polls for answer |
-| `PostToolUse` → `ExitPlanMode` | `telegram_interactive.py` | Sends plan text + Approve/Reject/Edit buttons, polls for decision |
+| `PreToolUse` → `AskUserQuestion` | `telegram_interactive.py` | Forks background notifier, returns immediately for IDE |
+| `PreToolUse` → `ExitPlanMode` | `telegram_interactive.py` | Forks background notifier, returns immediately for IDE |
+| `PostToolUse` → `AskUserQuestion` | `telegram_interactive.py` | Cancels delayed Telegram notification |
+| `PostToolUse` → `ExitPlanMode` | `telegram_interactive.py` | Cancels delayed Telegram notification |
 | `Stop` | `telegram-notify.sh` | Sends completion notification + any new `.md` files as documents |
 
 ### Status line
@@ -150,9 +157,14 @@ Uses OAuth credentials from macOS Keychain (no tokens in files). Results are cac
 
 ## Customization
 
-### Poll timeout
+### Notification delay
 
-Set the `POLL_TIMEOUT` environment variable to change how long the script waits for Telegram responses (default: 120 seconds).
+Set the `NOTIFY_DELAY` environment variable (in seconds) to control how long to wait before sending a Telegram notification. Default: 120 seconds (2 minutes).
+
+```bash
+# In ~/.claude/.env
+NOTIFY_DELAY=60  # notify after 1 minute
+```
 
 ### Status line cache
 

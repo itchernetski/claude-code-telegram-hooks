@@ -17,15 +17,6 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "AskUserQuestion",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 ~/.claude/hooks/telegram_interactive.py"
-          }
-        ]
-      },
-      {
         "matcher": "ExitPlanMode",
         "hooks": [
           {
@@ -36,15 +27,6 @@
       }
     ],
     "PostToolUse": [
-      {
-        "matcher": "AskUserQuestion",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 ~/.claude/hooks/telegram_interactive.py"
-          }
-        ]
-      },
       {
         "matcher": "ExitPlanMode",
         "hooks": [

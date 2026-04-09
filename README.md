@@ -1,10 +1,10 @@
 # Claude Code Telegram Hooks
 
-Control Claude Code from Telegram. Get notifications when Claude needs your attention — plans to approve, questions to answer, and task completions.
+Control Claude Code from Telegram. Get notifications when Claude needs your attention — plans to approve and task completions.
 
 ## Features
 
-- **IDE-first interaction** — plans and questions show in IDE immediately; if you don't respond within a configurable delay, a notification is sent to Telegram
+- **IDE-first interaction** — plans show in IDE immediately; if you don't respond within a configurable delay, a notification is sent to Telegram
 - **Completion notifications** — get a Telegram message when Claude finishes a task, with any generated `.md` files attached
 - **Status line** — see context window usage %, 5-hour API limit %, and time until reset right in your terminal
 
@@ -75,19 +75,11 @@ The key sections to add:
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "AskUserQuestion",
-        "hooks": [{ "type": "command", "command": "python3 ~/.claude/hooks/telegram_interactive.py" }]
-      },
-      {
         "matcher": "ExitPlanMode",
         "hooks": [{ "type": "command", "command": "python3 ~/.claude/hooks/telegram_interactive.py" }]
       }
     ],
     "PostToolUse": [
-      {
-        "matcher": "AskUserQuestion",
-        "hooks": [{ "type": "command", "command": "python3 ~/.claude/hooks/telegram_interactive.py" }]
-      },
       {
         "matcher": "ExitPlanMode",
         "hooks": [{ "type": "command", "command": "python3 ~/.claude/hooks/telegram_interactive.py" }]
@@ -108,7 +100,7 @@ The hooks will be picked up on the next session.
 │ Claude Code  │────▶│  Hook Scripts     │     │ Telegram │
 │              │     │                  │     │   Bot    │
 │ SessionStart │────▶│ session-marker.sh│     │          │
-│ AskQuestion  │────▶│ PreToolUse: fork │     │          │
+│ ExitPlanMode │────▶│ PreToolUse: fork │     │          │
 │              │     │   bg notifier    │     │          │
 │ (user answers│────▶│ PostToolUse:     │     │          │
 │  in IDE)     │     │   cancel signal  │     │          │
@@ -121,9 +113,9 @@ The hooks will be picked up on the next session.
 
 ### Flow
 
-1. Claude calls `AskUserQuestion` or `ExitPlanMode`
+1. Claude calls `ExitPlanMode`
 2. **PreToolUse** hook fires → forks a background process with a timer → returns immediately
-3. IDE shows the plan/question to the user (no delay)
+3. IDE shows the plan to the user (no delay)
 4. **If user responds in IDE** → PostToolUse fires → writes cancel signal → background process is killed
 5. **If user is AFK** → background process wakes up after `NOTIFY_DELAY` seconds → sends read-only notification to Telegram
 
@@ -132,9 +124,7 @@ The hooks will be picked up on the next session.
 | Event | Script | What happens |
 |-------|--------|-------------|
 | `SessionStart` | `session-marker.sh` | Creates a timestamp marker for tracking file changes |
-| `PreToolUse` → `AskUserQuestion` | `telegram_interactive.py` | Forks background notifier, returns immediately for IDE |
 | `PreToolUse` → `ExitPlanMode` | `telegram_interactive.py` | Forks background notifier, returns immediately for IDE |
-| `PostToolUse` → `AskUserQuestion` | `telegram_interactive.py` | Cancels delayed Telegram notification |
 | `PostToolUse` → `ExitPlanMode` | `telegram_interactive.py` | Cancels delayed Telegram notification |
 | `Stop` | `telegram-notify.sh` | Sends completion notification + any new `.md` files as documents |
 

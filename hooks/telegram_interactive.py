@@ -162,72 +162,6 @@ def _background_notify_plan(token, chat_id, plan_text, sig_path):
     send_message(token, chat_id, header + safe_text)
 
 
-def handle_ask_user_question_pre(token, chat_id, hook_input):
-    """PreToolUse: fork background notifier, return immediately for IDE."""
-    session_id = hook_input.get("session_id", "default")
-    tool_input = hook_input.get("tool_input", {})
-    questions = tool_input.get("questions", [])
-
-    if not questions:
-        sys.exit(0)
-
-    # Clean up any previous cancel signal
-    sig_path = cancel_signal_path("question", session_id)
-    if os.path.exists(sig_path):
-        os.remove(sig_path)
-
-    # Fork background process
-    pid = os.fork()
-    if pid > 0:
-        # Parent: save child PID and return immediately
-        pid_path = pid_file_path("question", session_id)
-        with open(pid_path, "w") as f:
-            f.write(str(pid))
-        sys.exit(0)
-
-    # Child: detach and become background notifier
-    os.setsid()
-    try:
-        _background_notify_question(token, chat_id, questions, sig_path)
-    except Exception:
-        pass
-    os._exit(0)
-
-
-def _background_notify_question(token, chat_id, questions, sig_path):
-    """Background process: sleep, then send question notification if not cancelled."""
-    import time
-    time.sleep(NOTIFY_DELAY)
-
-    # Check cancel signal
-    if os.path.exists(sig_path):
-        os.remove(sig_path)
-        return
-
-    # Format questions as readable text
-    for q in questions:
-        question_text = q.get("question", "")
-        header_text = q.get("header", "")
-        options = q.get("options", [])
-
-        msg = f"❓ *Claude Code задал вопрос*\n\n"
-        if header_text:
-            msg += f"*{header_text}*\n"
-        msg += f"{question_text}\n\n"
-
-        if options:
-            msg += "Варианты:\n"
-            for opt in options:
-                label = opt.get("label", "")
-                desc = opt.get("description", "")
-                msg += f"• {label}"
-                if desc:
-                    msg += f" — {desc}"
-                msg += "\n"
-
-        send_message(token, chat_id, msg)
-
-
 def handle_post_tool(hook_input):
     """PostToolUse: write cancel signal to prevent delayed Telegram notification."""
     tool_name = hook_input.get("tool_name", "")
@@ -235,8 +169,6 @@ def handle_post_tool(hook_input):
 
     if tool_name == "ExitPlanMode":
         key = "plan"
-    elif tool_name == "AskUserQuestion":
-        key = "question"
     else:
         sys.exit(0)
 
@@ -283,8 +215,6 @@ def main():
     # PreToolUse: fork background notifier, return immediately
     if tool_name == "ExitPlanMode":
         handle_exit_plan_mode_pre(token, chat_id, hook_input)
-    elif tool_name == "AskUserQuestion":
-        handle_ask_user_question_pre(token, chat_id, hook_input)
     else:
         sys.exit(0)
 

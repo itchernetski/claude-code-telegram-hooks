@@ -13,6 +13,8 @@ Example status line:
 skills · 12% ctx · 22% limit · 3h46m before reset
 ```
 
+> **Note:** Tested on macOS only. Linux may work (uses `os.fork()`, `jq`, `curl`) but is untested. Windows is not supported.
+
 ## Prerequisites
 
 - **macOS** (uses `os.fork()` for background notifications and Keychain for OAuth in status line)
